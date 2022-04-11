@@ -4,7 +4,6 @@ import dill
 import types
 from typing import Union
 import random
-import spikeval
 import shap
 import yaml
 import sys
@@ -19,6 +18,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import OrdinalEncoder
+
 from sklearn.utils import shuffle
 
 from sklearn.linear_model import LogisticRegression
@@ -125,8 +125,10 @@ def load_and_split_data(model: ClassifierModel,
     return train, validate, test
 
 def create_preprocessor(
-    train: pd.DataFrame,
-    model_settings: dict) -> ColumnTransformer:
+                        train: pd.DataFrame, 
+                        categorical_features:list, 
+                        numerical_features:list
+                        ) -> ColumnTransformer:
     """_summary_
 
     Args:
@@ -140,8 +142,9 @@ def create_preprocessor(
     #For categorical variables, we first need to impute NaN values, and then encode.
     categorical_transformer = Pipeline(
         steps=[
-            ("encoder", OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-2)),
             ("imputer", SimpleImputer(strategy="most_frequent")),
+            ("encoder", OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=np.nan)),
+            
         ]
     )
     
@@ -151,46 +154,65 @@ def create_preprocessor(
     #Create preprocessor
     preprocessor = ColumnTransformer(
         transformers=[
-            ("cat", categorical_transformer, model_settings["categorical_columns"]),
-            ("num", numeric_transformer, model_settings["numerical_columns"]),
+            ("cat", categorical_transformer, categorical_features),
+            ("num", numeric_transformer, numerical_features),
         ]
     )
-    
+    print(preprocessor)
     #Fit preprocessor to existing data
-    preprocessor.fit(train.loc[:, model_settings["categorical_columns"]+model_settings["numerical_columns"]])
+    preprocessor.fit(train.loc[:, categorical_features+numerical_features])
 
     return preprocessor
 
-def set_lgbm_train_valid_dsets(model, train, validate):
+def set_lgbm_train_valid_dsets( train: pd.DataFrame, 
+                                validate: pd.DataFrame, 
+                                preprocessor: ColumnTransformer,
+                                categorical_features:list, 
+                                numerical_features:list,
+                                target_column: str
+                                ):
+    """_summary_
+
+    Args:
+        train (pd.DataFrame): _description_
+        validate (pd.DataFrame): _description_
+        preprocessor (ColumnTransformer): _description_
+        categorical_features (list): _description_
+        numerical_features (list): _description_
+
+    Returns:
+        _type_: _description_
+    """
    
     # Transform x with preprocessor
     X_train_transformed = pd.DataFrame(
-        model.preprocessor.transform(
-            train.loc[:,model.model_settings["categorical_columns"]
-                        +model.model_settings["numerical_columns"]]),
-        columns=model.model_settings["categorical_columns"]+model.model_settings["numerical_columns"])
+        preprocessor.transform(
+            train.loc[:,categorical_features
+                        +numerical_features]),
+        columns=categorical_features+numerical_features)
 
     X_valid_transformed = pd.DataFrame(
-        model.preprocessor.transform(
-            validate.loc[:,model.model_settings["categorical_columns"]
-                        +model.model_settings["numerical_columns"]]),
-        columns=model.model_settings["categorical_columns"]+model.model_settings["numerical_columns"])
+        preprocessor.transform(
+            validate.loc[:,categorical_features
+                        +numerical_features]),
+        columns=categorical_features+numerical_features)
 
     # Create LGBM datasets
     train_dset = lgb.Dataset(
         pd.DataFrame(X_train_transformed,
-                    columns=model.model_settings["categorical_columns"]+model.model_settings["numerical_columns"]),
-        categorical_feature=model.model_settings["categorical_columns"],
-        label=train.loc[:,model.model_settings["label_column"]],
+                    columns=categorical_features+numerical_features),
+        categorical_feature=categorical_features,
+        label=train.loc[:,[target_column]],
         free_raw_data=False)
 
     valid_dset = lgb.Dataset(
         pd.DataFrame(X_valid_transformed, 
-                    columns=model.model_settings["categorical_columns"]+model.model_settings["numerical_columns"]),
-        categorical_feature=model.model_settings["categorical_columns"],
-        label= validate.loc[:,model.model_settings["label_column"]],
+                    columns=categorical_features+numerical_features),
+        categorical_feature=categorical_features,
+        label= validate.loc[:,[target_column]],
         free_raw_data=False)
     
+
     del X_train_transformed, X_valid_transformed
 
     return train_dset, valid_dset
@@ -291,13 +313,22 @@ def dual_loss_and_hyperparams_objective(trial,
                            feval = focal_loss_eval,
                            
                            early_stopping_rounds=25,
-                           #verbose_eval = False
+                           verbose_eval = False
                           )
 
     lgbm_model.predict_proba = types.MethodType(predict_proba_func, lgbm_model)
     
-    fpr, tpr, thresholds = roc_curve(valid_dset.label, lgbm_model.predict_proba(valid_dset.data))
-    metric = auc(fpr, tpr)
+    print(f"labels: {valid_dset.label}")
+    print(f"predict proba: {lgbm_model.predict_proba(valid_dset.data)}")
+
+    fig = px.histogram(pd.DataFrame(data = {'labels':valid_dset.label, 'probas':lgbm_model.predict_proba(valid_dset.data)}),
+                        x = 'probas',
+                        color = 'labels')
+    fig.show()
+
+    #fpr, tpr, thresholds = roc_curve(valid_dset.label, lgbm_model.predict_proba(valid_dset.data))
+    #metric = auc(fpr, tpr)
+    metric = average_precision_score(valid_dset.label, lgbm_model.predict_proba(valid_dset.data))
 
     return metric
 
@@ -338,12 +369,16 @@ def loss_function_objective(trial,
                            feval = focal_loss_eval,
                            
                            early_stopping_rounds=25,
-                           #verbose_eval = False
+                           verbose_eval = False
                           )
 
     lgbm_model.predict_proba = types.MethodType(predict_proba_func, lgbm_model)
     
-
+    fig = px.histogram(pd.DataFrame(data = {'labels':valid_dset.label, 'probas':lgbm_model.predict_proba(valid_dset.data)}),
+                        x = 'probas',
+                        color = 'labels')
+    fig.show()
+    print(f"Best iteration: {lgbm_model.best_iteration}")
     # CALIBRATE
     # -------------------
     #isotonic = IsotonicRegression(out_of_bounds='clip',
@@ -358,12 +393,12 @@ def loss_function_objective(trial,
     #metric = log_loss(valid_dset.label, isotonic.predict(sigmoid(lgbm_model.predict(valid_dset.data))))
 
     
-    fpr, tpr, thresholds = roc_curve(valid_dset.label, lgbm_model.predict_proba(valid_dset.data))
-    metric = auc(fpr, tpr)
+    #fpr, tpr, thresholds = roc_curve(valid_dset.label, lgbm_model.predict_proba(valid_dset.data))
+    #metric = auc(fpr, tpr)
    
     #metric = log_loss(valid_dset.label, lgbm_model.predict_proba(valid_dset.data))
     
-    #metric = average_precision_score(valid_dset.label, lgbm_model.predict_proba(valid_dset.data))
+    metric = average_precision_score(valid_dset.label, lgbm_model.predict_proba(valid_dset.data))
         
     return metric
 
@@ -424,11 +459,17 @@ def hyperparams_objective(trial,
                            feval = focal_loss_eval,
                            
                            early_stopping_rounds=25,
-                           #verbose_eval = False
+                           verbose_eval = False
                            )
     
     lgbm_model.predict_proba = types.MethodType(predict_proba_func, lgbm_model)
     
+    fig = px.histogram(pd.DataFrame(data = {'labels':valid_dset.label, 'probas':lgbm_model.predict_proba(valid_dset.data)}),
+                        x = 'probas',
+                        color = 'labels')
+    fig.show()
+    
+    print(f"Best iteration: {lgbm_model.best_iteration}")
     # CALIBRATE
     # -------------------
     #isotonic = IsotonicRegression(out_of_bounds='clip',
@@ -447,7 +488,7 @@ def hyperparams_objective(trial,
    
     #metric = log_loss(valid_dset.label, lgbm_model.predict_proba(valid_dset.data))
     
-    #metric = average_precision_score(valid_dset.label, lgbm_model.predict_proba(valid_dset.data))
+    metric = average_precision_score(valid_dset.label, lgbm_model.predict_proba(valid_dset.data))
 
     return metric
 
@@ -486,7 +527,7 @@ def iterate_for_optimal_boosting_rounds(params,
     focal_loss = lambda x,y: focal_loss_lgb(x, y, alpha=params['alpha'], gamma=params['gamma'])
     focal_loss_eval = lambda x,y: focal_loss_lgb_eval_error(x, y, alpha=params['alpha'], gamma=params['gamma'])
     
-    params['learning_rate']=0.01
+    params['learning_rate']=0.1
     #Run several to obtain best iteration from each round
     for seed in np.arange(model_settings["n_iters_boost_rounds"]):
         
@@ -504,9 +545,9 @@ def iterate_for_optimal_boosting_rounds(params,
                                early_stopping_rounds=25,
                                num_boost_round=10000,
                                
-                               #verbose_eval = False
+                               verbose_eval = False
                                )
-        print(f"Finished trial. Best iteration: {classifier.best_iteration}")
+        print(f"Finished trial{seed}. Best iteration: {classifier.best_iteration}")
         best_iterations.append(classifier.best_iteration)
         
     del classifier
@@ -573,12 +614,12 @@ def model_tunning_focal_loss_2_steps(model, train, validate):
     model_params = {"boosting": "gbdt",
                     "deterministic":True,
                     "num_iterations": 10000, #Will have early stopping for tunning
-                    'learning_rate':0.1,
+                    'learning_rate':0.5,
                     'verbosity':-1}
     
     print(model_params)
     
-    train_dset, valid_dset = set_lgbm_train_valid_dsets(model, train, validate)
+    train_dset, valid_dset = set_lgbm_train_valid_dsets(train, validate, numerical_features, categorical_features, target_column)
     
     # -----------------------------------------------------
     # TUNE LOSS FUNCTION
@@ -644,14 +685,14 @@ def model_tunning_focal_loss_1_step(model, train, validate):
     
     model_params = {"boosting": "gbdt",
                     "deterministic":True,
-                    "num_iterations": 10000, #Will have early stopping for tunning
+                    "num_iterations": 500, #Will have early stopping for tunning
                     'learning_rate':0.1,
-                    #'verbosity':-1
+                    'verbosity':-1
                     }
     
     print(model_params)
     
-    train_dset, valid_dset = set_lgbm_train_valid_dsets(model, train, validate)
+    train_dset, valid_dset = set_lgbm_train_valid_dsets(train, validate, numerical_features, categorical_features, target_column)
     
     # -----------------------------------------------------
     # TUNE LOSS FUNCTION
@@ -664,9 +705,9 @@ def model_tunning_focal_loss_1_step(model, train, validate):
                                                                                             model_params),
                                                                                             n_trials=model.model_settings["n_iters_hyperparams"])
 
-    best_params = get_study_results(loss_function_study)
+    best_params = get_study_results(dual_loss_hyperparams_study)
     
-    del loss_function_study
+    del dual_loss_hyperparams_study
     model_params.update(best_params)
     print(f"{model_params} \n --------------------------------")
  
@@ -674,26 +715,91 @@ def model_tunning_focal_loss_1_step(model, train, validate):
 
     return model_params
 
-def model_tuning_logloss(model, train, validate):
+def model_tuning_logloss(
+                            train: pd.DataFrame, 
+                            validate: pd.DataFrame, 
+                            numerical_features: list, 
+                            categorical_features: list, 
+                            optuna_eval_metric = 'binary_logloss'
+
+                        )-> dict:
 
     model_params = {'objective': 'binary',
-                    'metric': model.model_settings['optuna_eval_metric'],
+                    'metric': optuna_eval_metric,
                     "boosting": "gbdt",
                     "deterministic":True,
                     'learning_rate':0.1,
-                    #'verbosity':-1
+                    'verbosity':-1
                     }
     
     print(model_params)
     
-    train_dset, valid_dset = set_lgbm_train_valid_dsets(model, train, validate)
+    train_dset, valid_dset = set_lgbm_train_valid_dsets(train, validate, numerical_features, categorical_features, target_column)
 
 
-    modelo = olgb.train(train_set=train_dset,
+    optuna_model = olgb.train(train_set=train_dset,
                        valid_sets=[valid_dset,],
                        num_boost_round = 5000,
                        early_stopping_rounds = 25,
-                       #verbose_eval = False,
+                       verbose_eval = False,
                        params=model_params)
 
-    return modelo.params
+    return optuna_model.params
+
+
+def train_lgbm(model, train, validate):
+    """
+    Trains the LGBM model according to params
+    Parameters:
+    -----------
+        model_name: str
+            model name as deffined in model settings
+        train: DataFrame,
+            DF with training data
+    Returns:
+    -----------
+       model : LGBMClassifier,
+        
+    """
+    #-------------------------------------------------------------
+    # Prepare data
+    #-------------------------------------------------------------
+    
+    train = train.append(validate)
+    
+    X_train_transformed = pd.DataFrame(
+        model.preprocessor.transform(
+            train.loc[:,model.model_settings["categorical_columns"]
+                        +model.model_settings["numerical_columns"]]), 
+        columns=model.model_settings["categorical_columns"]
+        +model.model_settings["numerical_columns"])
+    
+    train_dset = lgb.Dataset(pd.DataFrame(X_train_transformed, columns=model.model_settings["categorical_columns"]+model.model_settings["numerical_columns"]),
+                         categorical_feature=model.model_settings["categorical_columns"],
+                         label=train.loc[:,model.model_settings['y_column']],
+                         free_raw_data=False)
+
+    del X_train_transformed
+    #---------------------------------------------------------------------
+    # Train model according to objective function defined in parameters
+    #---------------------------------------------------------------------
+    
+    if model.model_settings['loss_function'] == 'focal_loss':
+        focal_loss = lambda x,y: focal_loss_lgb(x, y, alpha=model.model.hyperparams['alpha'], gamma=model.hyperparams['gamma'])
+
+        # Fit data to model
+        classifier = lgb.train(params=model.hyperparams,
+                            train_set=train_dset,
+                            fobj = focal_loss,
+                            verbose_eval = False)
+    
+    elif model.model_settings['loss_function'] == 'log_loss':
+
+        params = model.hyperparams
+        params['objective'] = 'binary_logloss'
+        # Fit data to model
+        classifier = lgb.train( params=model.hyperparams,
+                                train_set=train_dset,
+                                verbose_eval = False)
+    
+    return classifier
